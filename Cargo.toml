@@ -1,0 +1,12 @@
+[package]
+name = "LumiaLive"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4.9.0"
+dotenv = "0.15.0"
+hueclient = "0.4.3"
+parking_lot = "0.12.3"
+serde = "1.0.217"
+tokio = "1.43.0"
