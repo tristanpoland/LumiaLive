@@ -1,10 +1,11 @@
 {
-    "credentials": {
+  "debug_mode": true,
+  "credentials": {
       "streamlabs": {
-        "socket_token": "your_streamlabs_socket_token_here"
+        "socket_token": ""
       },
       "hue": {
-        "username": "your_hue_bridge_username",
+        "username": "",
         "bridge_ip": null
       }
     },

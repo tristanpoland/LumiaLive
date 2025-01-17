@@ -15,6 +15,7 @@ use log::{info, warn, error, debug};
 use tokio::signal;
 use tokio::sync::mpsc;
 use thiserror::Error;
+use serde_json::Value;
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -34,7 +35,7 @@ pub enum AppError {
     InvalidAmount(String),
 }
 
-// Configuration structures
+// Keep existing config structures
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct Config {
     credentials: Credentials,
@@ -102,13 +103,14 @@ struct LightEffect {
     duration: u64,
 }
 
-// Streamlabs event structures
+// Updated Streamlabs event structures
 #[derive(Debug, Deserialize)]
 struct StreamlabsEvent {
-    #[serde(rename = "type")]
-    event_type: String,
+    event_id: String,
     #[serde(rename = "for")]
     event_for: Option<String>,
+    #[serde(rename = "type")]
+    event_type: String,
     message: Vec<EventMessage>,
 }
 
@@ -120,6 +122,21 @@ struct EventMessage {
     amount: Option<String>,
     #[serde(default)]
     formatted_amount: Option<String>,
+    #[serde(default)]
+    _id: String,
+    #[serde(default)]
+    id: Option<String>,
+    payload: Option<EventPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventPayload {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
 }
 
 struct AppState {
@@ -127,7 +144,7 @@ struct AppState {
     config: Config,
 }
 
-// Convert hex color to Hue values
+// Existing hex_to_hue function remains the same
 fn hex_to_hue(hex: &str) -> Result<(u16, u8), AppError> {
     let hex = hex.trim_start_matches('#');
     let rgb = Vec::from_hex(hex)
@@ -139,7 +156,6 @@ fn hex_to_hue(hex: &str) -> Result<(u16, u8), AppError> {
     
     let (r, g, b) = (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
     
-    // Convert RGB to HSV
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let delta = max - min;
@@ -156,7 +172,6 @@ fn hex_to_hue(hex: &str) -> Result<(u16, u8), AppError> {
     
     let saturation = if max == 0.0 { 0.0 } else { delta / max };
     
-    // Convert to Hue bridge values
     let hue = ((hue / 360.0) * 65535.0) as u16;
     let saturation = (saturation * 254.0) as u8;
     
@@ -165,29 +180,43 @@ fn hex_to_hue(hex: &str) -> Result<(u16, u8), AppError> {
 
 impl AppState {
     async fn handle_event(&self, event: StreamlabsEvent) -> Result<(), AppError> {
-        debug!("Processing event: {:?}", event);
+        info!("Processing event: {:?}", event);
         
-        match (event.event_type.as_str(), event.event_for.as_deref()) {
+        let result = match (event.event_type.as_str(), event.event_for.as_deref()) {
             ("donation", None) if self.config.events.donation.enabled => {
+                info!("Handling donation event");
                 if let Some(message) = event.message.first() {
                     self.handle_donation(message).await?;
                 }
+                Ok(())
             },
             ("follow", Some("twitch_account")) if self.config.events.twitch_follow.enabled => {
-                self.handle_twitch_follow().await?;
+                info!("Handling Twitch follow event");
+                self.handle_twitch_follow().await
             },
             ("subscription", Some("twitch_account")) if self.config.events.twitch_subscription.enabled => {
-                self.handle_twitch_subscription().await?;
+                info!("Handling Twitch subscription event");
+                self.handle_twitch_subscription().await
             },
             ("bits", Some("twitch_account")) if self.config.events.twitch_bits.enabled => {
+                info!("Handling Twitch bits event");
                 if let Some(message) = event.message.first() {
                     self.handle_bits(message).await?;
                 }
+                Ok(())
             },
-            _ => debug!("Unhandled or disabled event: {:?}", event),
+            _ => {
+                info!("Unhandled or disabled event: type={}, for={:?}", 
+                      event.event_type, event.event_for);
+                Ok(())
+            }
+        };
+
+        if let Err(e) = &result {
+            error!("Error processing event: {}", e);
         }
         
-        Ok(())
+        result
     }
 
     async fn handle_donation(&self, message: &EventMessage) -> Result<(), AppError> {
@@ -237,6 +266,7 @@ impl AppState {
     }
 
     async fn apply_effect(&self, effect: &LightEffect) -> Result<(), AppError> {
+        info!("Applying light effect: {:?}", effect);
         let bridge = self.bridge.lock();
         let (hue, sat) = hex_to_hue(&effect.color)?;
         
@@ -247,20 +277,22 @@ impl AppState {
         command.sat = Some(sat);
         command.alert = Some(effect.alert.clone());
 
-        debug!("Applying light effect: {:?}", effect);
+        info!("Created light command with hue={}, sat={}", hue, sat);
         
         let lights = bridge.get_all_lights()
             .map_err(|e| AppError::Bridge(e.to_string()))?;
             
+        info!("Applying effect to {} lights", lights.len());
         for light in lights {
+            info!("Setting state for light {}", light.id);
             bridge.set_light_state(light.id, &command)
                 .map_err(|e| AppError::Bridge(e.to_string()))?;
         }
 
-        // Reset after duration
+        info!("Waiting {} ms before resetting", effect.duration);
         sleep(Duration::from_millis(effect.duration)).await;
         
-        debug!("Resetting lights to default state");
+        info!("Resetting lights to default state");
         let mut reset_command = CommandLight::default();
         reset_command.on = Some(self.config.default_state.on);
         reset_command.bri = Some(self.config.default_state.brightness);
@@ -272,6 +304,7 @@ impl AppState {
             .map_err(|e| AppError::Bridge(e.to_string()))?;
             
         for light in lights {
+            info!("Resetting light {}", light.id);
             bridge.set_light_state(light.id, &reset_command)
                 .map_err(|e| AppError::Bridge(e.to_string()))?;
         }
@@ -280,113 +313,203 @@ impl AppState {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), AppError> {
-    // Initialize logging with env_logger
+fn process_event(message: &str, tx: &mpsc::Sender<StreamlabsEvent>) {
+    info!("Processing message: {}", message);
+    match serde_json::from_str::<StreamlabsEvent>(message) {
+        Ok(event) => {
+            info!("Successfully parsed event: {:?}", event);
+            match (event.event_type.as_str(), event.event_for.as_deref()) {
+                ("donation", None) |
+                ("follow", Some("twitch_account")) |
+                ("subscription", Some("twitch_account")) |
+                ("bits", Some("twitch_account")) => {
+                    info!("Sending valid event to handler: {:?}", event);
+                    if let Err(e) = tx.blocking_send(event) {
+                        error!("Failed to send event to handler: {}", e);
+                    }
+                }
+                _ => {
+                    debug!("Ignoring unhandled event type: {:?}", event);
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to parse Streamlabs event: {}", e);
+            error!("Raw message that failed to parse: {}", message);
+        }
+    }
+}
+
+fn main() -> Result<(), AppError> {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .init();
     
     info!("Starting LumiaLive...");
     
-    info!("Loading configuration...");
-    let config: Config = serde_json::from_str(&fs::read_to_string("config.json")?)?;
-    
-    info!("Connecting to Hue bridge...");
-    // Fix for Bridge creation
-    let bridge = if let Some(ip) = &config.credentials.hue.bridge_ip {
-        Bridge::discover()
-            .ok_or_else(|| AppError::Bridge("Failed to discover bridge".to_string()))?
-            .with_user(&config.credentials.hue.username)
-    } else {
-        info!("No bridge IP configured, discovering bridge...");
-        Bridge::discover_required()
-            .with_user(&config.credentials.hue.username)
-    };
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
 
-    let bridge = Arc::new(Mutex::new(bridge));
-    
-    let state = Arc::new(AppState {
-        bridge: bridge.clone(),
-        config: config.clone(),
-    });
-
-    // Create channels for event handling
-    let (event_tx, mut event_rx) = mpsc::channel::<StreamlabsEvent>(32);
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    // Get a handle to the current runtime
-    let rt = tokio::runtime::Handle::current();
-
-    // Spawn event handler task
-    let handle_events = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            while let Some(event) = event_rx.blocking_recv() {
-                if let Err(e) = rt.block_on(state.handle_event(event)) {
-                    error!("Error handling event: {}", e);
+    std::thread::spawn(move || {
+        info!("Loading configuration...");
+        let config: Config = match fs::read_to_string("config.json") {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    error!("Failed to parse config.json: {}", e);
+                    return;
                 }
-                
-                // Check for shutdown signal
-                if shutdown_rx.try_recv().is_ok() {
-                    break;
-                }
+            },
+            Err(e) => {
+                error!("Failed to read config.json: {}", e);
+                return;
             }
-        })
-    };
+        };
 
-    info!("Connecting to Streamlabs socket API...");
-    let socket_url = "https://sockets.streamlabs.com";
-    
-    let client = ClientBuilder::new(socket_url)
-        .on_any({
-            let tx = event_tx.clone();
-            move |_event: Event, payload: Payload, _| {
-                if let Payload::String(message) = payload {
-                    if let Ok(event) = serde_json::from_str::<StreamlabsEvent>(&message) {
-                        let tx = tx.clone();
-                        if let Err(e) = tx.blocking_send(event) {
-                            error!("Failed to send event to handler: {}", e);
+        let (event_tx, event_rx) = mpsc::channel::<StreamlabsEvent>(32);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+
+        info!("Connecting to Streamlabs socket API...");
+        let socket_url = format!(
+            "https://sockets.streamlabs.com?token={}", 
+            config.credentials.streamlabs.socket_token
+        );
+        
+        info!("Using socket URL: {}", socket_url);
+
+        let client = match ClientBuilder::new(&socket_url)
+            .transport_type(rust_socketio::TransportType::Websocket)
+            .on("connect", |_, _| {
+                info!("Socket.IO connected successfully!");
+            })
+            .on("disconnect", |_, _| {
+                warn!("Socket.IO disconnected!");
+            })
+            .on("connect_error", |err, _| {
+                error!("Socket.IO connection error: {:?}", err);
+            })
+            .on("event", {
+                let tx = event_tx.clone();
+                move |payload: Payload, _| {
+                    info!("Received raw socket event");
+                    match payload {
+                        Payload::String(message) => {
+                            info!("Processing String payload: {}", message);
+                            process_event(&message, &tx);
                         }
-                    } else {
-                        warn!("Failed to parse Streamlabs event");
+                        Payload::Text(json_value) => {
+                            info!("Processing Text payload: {:?}", json_value);
+                            if let Some(first_event) = json_value.first() {
+                                if let Ok(message) = serde_json::to_string(first_event) {
+                                    process_event(&message, &tx);
+                                } else {
+                                    error!("Failed to serialize JSON value to string");
+                                }
+                            } else {
+                                error!("Text payload is not an array");
+                            }
+                        }
+                        other => {
+                            warn!("Received unexpected payload type: {:?}", other);
+                        }
+                    }
+                }
+            })
+            .connect() {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to connect to Streamlabs: {}", e);
+                    return;
+                }
+            };
+
+        info!("Connected to Streamlabs!");
+
+        // Initialize Hue bridge and state
+        let state = rt.block_on(async {
+            info!("Connecting to Hue bridge...");
+            let bridge = if let Some(ip) = &config.credentials.hue.bridge_ip {
+                info!("Using configured bridge IP: {}", ip);
+                match Bridge::discover() {
+                    Some(bridge) => bridge.with_user(&config.credentials.hue.username),
+                    None => {
+                        error!("Failed to discover bridge at configured IP");
+                        return Err(AppError::Bridge("Failed to discover bridge".to_string()));
+                    }
+                }
+            } else {
+                info!("No bridge IP configured, discovering bridge...");
+                Bridge::discover_required()
+                    .with_user(&config.credentials.hue.username)
+            };
+
+            let bridge = Arc::new(Mutex::new(bridge));
+            
+            // Test bridge connection
+            {
+                let bridge_lock = bridge.lock();
+                match bridge_lock.get_all_lights() {
+                    Ok(lights) => info!("Successfully connected to bridge. Found {} lights", lights.len()),
+                    Err(e) => {
+                        error!("Failed to get lights from bridge: {}", e);
+                        return Err(AppError::Bridge(format!("Failed to get lights: {}", e)));
                     }
                 }
             }
-        })
-        .connect()
-        .map_err(|e| {
-            error!("Failed to connect to Streamlabs: {}", e);
-            AppError::SocketIo(e)
-        })?;
+            
+            Ok::<_, AppError>(Arc::new(AppState {
+                bridge: bridge.clone(),
+                config: config.clone(),
+            }))
+        }).expect("Failed to initialize bridge");
 
-    // Emit the token as a string
-    let token_payload = Payload::String(config.credentials.streamlabs.socket_token.clone());
-    client.emit("token", token_payload)
-        .map_err(|e| AppError::SocketIo(e))?;
+        // Spawn event handler
+        let _event_handler = {
+            let state = state.clone();
+            let mut event_rx = event_rx;
+            let rt_handle = rt.handle().clone();
+            rt.spawn_blocking(move || {
+                info!("Event handler thread started");
+                while let Some(event) = event_rx.blocking_recv() {
+                    info!("Processing event in handler: {:?}", event);
+                    if let Err(e) = rt_handle.block_on(state.handle_event(event)) {
+                        error!("Error handling event: {}", e);
+                    }
+                }
+                info!("Event handler thread shutting down");
+            })
+        };
 
-    info!("Connected and ready!");
+        info!("System ready! Waiting for events...");
+
+        // Wait for shutdown signal
+        match shutdown_rx.recv() {
+            Ok(_) => info!("Received shutdown signal"),
+            Err(e) => error!("Shutdown receiver error: {}", e),
+        }
+
+        // Clean shutdown
+        info!("Shutdown signal received, cleaning up...");
+        drop(event_tx);
+        if let Err(e) = client.disconnect() {
+            error!("Error during disconnect: {}", e);
+        }
+        info!("Shutdown complete");
+    });
+
+    // Main thread just waits for ctrl-c
+    info!("Press Enter to exit...");
+    if let Err(e) = std::io::stdin().read_line(&mut String::new()) {
+        error!("Error waiting for input: {}", e);
+    }
     
-    // Wait for ctrl-c
-    match signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Shutdown signal received, cleaning up...");
-            let _ = shutdown_tx.send(()).await; // Signal event handler to stop
-            drop(event_tx); // Close event channel
-            
-            if let Err(e) = handle_events.await {
-                error!("Error during event handler shutdown: {}", e);
-            }
-            
-            if let Err(e) = client.disconnect() {
-                error!("Error during disconnect: {}", e);
-            }
-            info!("Shutdown complete");
-        }
-        Err(err) => {
-            error!("Unable to listen for shutdown signal: {}", err);
-            let _ = client.disconnect();
-        }
+    // Signal shutdown
+    info!("Sending shutdown signal...");
+    if let Err(e) = shutdown_tx.send(()) {
+        error!("Error sending shutdown signal: {}", e);
     }
     
     Ok(())
