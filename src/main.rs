@@ -1,23 +1,118 @@
-use actix_web::{web, App, HttpResponse, HttpServer};
 use hueclient::{Bridge, CommandLight};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use rust_socketio::{
+    client::ClientBuilder,
+    payload::Payload,
+    Event,
+};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
-use dotenv::dotenv;
-use std::env;
+use std::fs;
+use hex::FromHex;
+use log::{info, warn, error, debug};
+use tokio::signal;
+use thiserror::Error;
 
-// Streamlabs webhook payload structures
+#[derive(Error, Debug)]
+pub enum AppError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    
+    #[error("Socket.io error: {0}")]
+    SocketIo(#[from] rust_socketio::Error),
+    
+    #[error("Bridge error: {0}")]
+    Bridge(String),
+    
+    #[error("Invalid amount format: {0}")]
+    InvalidAmount(String),
+}
+
+// Configuration structures
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct Config {
+    credentials: Credentials,
+    default_state: LightState,
+    events: EventConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct Credentials {
+    streamlabs: StreamlabsCredentials,
+    hue: HueCredentials,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct StreamlabsCredentials {
+    socket_token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct HueCredentials {
+    username: String,
+    bridge_ip: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct LightState {
+    on: bool,
+    brightness: u8,
+    hue: u16,
+    saturation: u8,
+    alert: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct EventConfig {
+    donation: EventTieredEffect,
+    twitch_follow: SimpleEventEffect,
+    twitch_subscription: SimpleEventEffect,
+    twitch_bits: EventTieredEffect,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct SimpleEventEffect {
+    enabled: bool,
+    effect: LightEffect,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct EventTieredEffect {
+    enabled: bool,
+    tiers: Vec<TierEffect>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct TierEffect {
+    amount: f64,
+    effect: LightEffect,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct LightEffect {
+    color: String,
+    brightness: u8,
+    alert: String,
+    duration: u64,
+}
+
+// Streamlabs event structures
 #[derive(Debug, Deserialize)]
-struct StreamlabsWebhook {
+struct StreamlabsEvent {
     #[serde(rename = "type")]
     event_type: String,
-    message: Vec<StreamlabsEvent>,
+    #[serde(rename = "for")]
+    event_for: Option<String>,
+    message: Vec<EventMessage>,
 }
 
 #[derive(Debug, Deserialize)]
-struct StreamlabsEvent {
+struct EventMessage {
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -26,205 +121,247 @@ struct StreamlabsEvent {
     formatted_amount: Option<String>,
 }
 
-// Hue bridge configuration
 struct AppState {
     bridge: Arc<Mutex<Bridge>>,
+    config: Config,
 }
 
-// Initialize Hue bridge connection
-async fn init_bridge() -> Bridge {
-    dotenv().ok();
-    let username = env::var("HUE_USERNAME").expect("HUE_USERNAME must be set");
+// Convert hex color to Hue values
+fn hex_to_hue(hex: &str) -> Result<(u16, u8), AppError> {
+    let hex = hex.trim_start_matches('#');
+    let rgb = Vec::from_hex(hex)
+        .map_err(|e| AppError::Bridge(format!("Invalid hex color: {}", e)))?;
     
-    Bridge::discover_required().with_user(&username)
+    if rgb.len() != 3 {
+        return Err(AppError::Bridge("Invalid RGB values".to_string()));
+    }
+    
+    let (r, g, b) = (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
+    
+    // Convert RGB to HSV
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    
+    let hue = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    
+    let saturation = if max == 0.0 { 0.0 } else { delta / max };
+    
+    // Convert to Hue bridge values
+    let hue = ((hue / 360.0) * 65535.0) as u16;
+    let saturation = (saturation * 254.0) as u8;
+    
+    Ok((hue, saturation))
 }
 
-// Handle different Streamlabs events
-async fn handle_webhook(
-    data: web::Json<StreamlabsWebhook>,
-    state: web::Data<AppState>,
-) -> HttpResponse {
-    println!("Received webhook: {:?}", data);
-
-    match data.event_type.as_str() {
-        "donation" => handle_donation(&state.bridge, &data.message[0]).await,
-        "follow" => handle_follow(&state.bridge).await,
-        "subscription" => handle_subscription(&state.bridge).await,
-        _ => println!("Unhandled event type: {}", data.event_type),
+impl AppState {
+    async fn handle_event(&self, event: StreamlabsEvent) -> Result<(), AppError> {
+        debug!("Processing event: {:?}", event);
+        
+        match (event.event_type.as_str(), event.event_for.as_deref()) {
+            ("donation", None) if self.config.events.donation.enabled => {
+                if let Some(message) = event.message.first() {
+                    self.handle_donation(message).await?;
+                }
+            },
+            ("follow", Some("twitch_account")) if self.config.events.twitch_follow.enabled => {
+                self.handle_twitch_follow().await?;
+            },
+            ("subscription", Some("twitch_account")) if self.config.events.twitch_subscription.enabled => {
+                self.handle_twitch_subscription().await?;
+            },
+            ("bits", Some("twitch_account")) if self.config.events.twitch_bits.enabled => {
+                if let Some(message) = event.message.first() {
+                    self.handle_bits(message).await?;
+                }
+            },
+            _ => debug!("Unhandled or disabled event: {:?}", event),
+        }
+        
+        Ok(())
     }
 
-    HttpResponse::Ok().finish()
-}
-
-// Handle donation events
-async fn handle_donation(bridge: &Arc<Mutex<Bridge>>, event: &StreamlabsEvent) {
-    if let Some(amount) = &event.amount {
-        let amount: f64 = amount.parse().unwrap_or(0.0);
+    async fn handle_donation(&self, message: &EventMessage) -> Result<(), AppError> {
+        if let Some(amount_str) = &message.amount {
+            let amount: f64 = amount_str.parse()
+                .map_err(|_| AppError::InvalidAmount(amount_str.clone()))?;
+            
+            let effect = self.config.events.donation.tiers
+                .iter()
+                .find(|tier| amount >= tier.amount)
+                .map(|tier| &tier.effect)
+                .unwrap_or_else(|| &self.config.events.donation.tiers.last().unwrap().effect);
+            
+            info!("Processing donation of {} from {}", amount_str, message.name);
+            self.apply_effect(effect).await?;
+        }
         
-        // Different effects based on donation amount
+        Ok(())
+    }
+
+    async fn handle_twitch_follow(&self) -> Result<(), AppError> {
+        info!("Processing Twitch follow");
+        self.apply_effect(&self.config.events.twitch_follow.effect).await
+    }
+
+    async fn handle_twitch_subscription(&self) -> Result<(), AppError> {
+        info!("Processing Twitch subscription");
+        self.apply_effect(&self.config.events.twitch_subscription.effect).await
+    }
+
+    async fn handle_bits(&self, message: &EventMessage) -> Result<(), AppError> {
+        if let Some(amount_str) = &message.amount {
+            let amount: f64 = amount_str.parse()
+                .map_err(|_| AppError::InvalidAmount(amount_str.clone()))?;
+            
+            let effect = self.config.events.twitch_bits.tiers
+                .iter()
+                .find(|tier| amount >= tier.amount)
+                .map(|tier| &tier.effect)
+                .unwrap_or_else(|| &self.config.events.twitch_bits.tiers.last().unwrap().effect);
+            
+            info!("Processing {} bits from {}", amount_str, message.name);
+            self.apply_effect(effect).await?;
+        }
+        
+        Ok(())
+    }
+
+    async fn apply_effect(&self, effect: &LightEffect) -> Result<(), AppError> {
+        let bridge = self.bridge.lock();
+        let (hue, sat) = hex_to_hue(&effect.color)?;
+        
         let mut command = CommandLight::default();
+        command.on = Some(true);
+        command.bri = Some(effect.brightness);
+        command.hue = Some(hue);
+        command.sat = Some(sat);
+        command.alert = Some(effect.alert.clone());
+
+        debug!("Applying light effect: {:?}", effect);
         
-        match amount {
-            a if a >= 100.0 => {
-                command.on = Some(true);
-                command.bri = Some(254);
-                command.hue = Some(0);    // Red
-                command.sat = Some(254);
-                command.alert = Some("lselect".into());
-            },
-            a if a >= 50.0 => {
-                command.on = Some(true);
-                command.bri = Some(254);
-                command.hue = Some(25500); // Green
-                command.sat = Some(254);
-                command.alert = Some("select".into());
-            },
-            _ => {
-                command.on = Some(true);
-                command.bri = Some(254);
-                command.hue = Some(46920); // Blue
-                command.sat = Some(254);
-                command.alert = Some("select".into());
+        let lights = bridge.get_all_lights()
+            .map_err(|e| AppError::Bridge(e.to_string()))?;
+            
+        for light in lights {
+            bridge.set_light_state(light.id, &command)
+                .map_err(|e| AppError::Bridge(e.to_string()))?;
+        }
+
+        // Reset after duration
+        sleep(Duration::from_millis(effect.duration)).await;
+        
+        debug!("Resetting lights to default state");
+        let mut reset_command = CommandLight::default();
+        reset_command.on = Some(self.config.default_state.on);
+        reset_command.bri = Some(self.config.default_state.brightness);
+        reset_command.hue = Some(self.config.default_state.hue);
+        reset_command.sat = Some(self.config.default_state.saturation);
+        reset_command.alert = Some(self.config.default_state.alert.clone());
+
+        let lights = bridge.get_all_lights()
+            .map_err(|e| AppError::Bridge(e.to_string()))?;
+            
+        for light in lights {
+            bridge.set_light_state(light.id, &reset_command)
+                .map_err(|e| AppError::Bridge(e.to_string()))?;
+        }
+        
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    // Initialize logging with env_logger
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+    
+    info!("Starting LumiaLive...");
+    
+    info!("Loading configuration...");
+    let config: Config = serde_json::from_str(&fs::read_to_string("config.json")?)?;
+    
+    info!("Connecting to Hue bridge...");
+    // Fix for Bridge creation
+    let bridge = if let Some(ip) = &config.credentials.hue.bridge_ip {
+        Bridge::discover()
+            .ok_or_else(|| AppError::Bridge("Failed to discover bridge".to_string()))?
+            .with_user(&config.credentials.hue.username)
+    } else {
+        info!("No bridge IP configured, discovering bridge...");
+        Bridge::discover_required()
+            .with_user(&config.credentials.hue.username)
+    };
+
+    
+    let bridge = Arc::new(Mutex::new(bridge));
+    
+    let state = Arc::new(AppState {
+        bridge: bridge.clone(),
+        config: config.clone(),
+    });
+
+    info!("Connecting to Streamlabs socket API...");
+    let socket_url = "https://sockets.streamlabs.com";
+    
+    let client = ClientBuilder::new(socket_url)
+        .on_any({
+            let state = state.clone();
+            move |event: Event, payload: Payload, _| {
+                if let Payload::String(message) = payload {
+                    if let Ok(event) = serde_json::from_str::<StreamlabsEvent>(&message) {
+                        let state = state.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            tokio::runtime::Runtime::new()
+                                .unwrap()
+                                .block_on(async {
+                                    if let Err(e) = state.handle_event(event).await {
+                                        error!("Error handling event: {}", e);
+                                    }
+                                });
+                        });
+                    } else {
+                        warn!("Failed to parse Streamlabs event");
+                    }
+                }
             }
-        };
+        })
+        .connect()
+        .map_err(|e| {
+            error!("Failed to connect to Streamlabs: {}", e);
+            AppError::SocketIo(e)
+        })?;
 
-        apply_effect(bridge, command).await;
-    }
-}
+    // Emit the token as a string
+    let token_payload = Payload::String(config.credentials.streamlabs.socket_token.clone());
+    client.emit("token", token_payload)
+        .map_err(|e| AppError::SocketIo(e))?;
 
-// Handle follow events
-async fn handle_follow(bridge: &Arc<Mutex<Bridge>>) {
-    let mut command = CommandLight::default();
-    command.on = Some(true);
-    command.bri = Some(254);
-    command.hue = Some(46920); // Blue
-    command.sat = Some(254);
-    command.alert = Some("select".into());
-
-    apply_effect(bridge, command).await;
-}
-
-// Handle subscription events
-async fn handle_subscription(bridge: &Arc<Mutex<Bridge>>) {
-    let mut command = CommandLight::default();
-    command.on = Some(true);
-    command.bri = Some(254);
-    command.hue = Some(25500); // Green
-    command.sat = Some(254);
-    command.alert = Some("select".into());
-
-    apply_effect(bridge, command).await;
-}
-
-// Apply light effect and reset after delay
-async fn apply_effect(bridge: &Arc<Mutex<Bridge>>, command: CommandLight) {
-    let bridge = bridge.lock();
+    info!("Connected and ready!");
     
-    // Get all lights
-    if let Ok(lights) = bridge.get_all_lights() {
-        for light in lights {
-            let _ = bridge.set_light_state(
-                light.id,
-                &command
-            );
+    // Handle shutdown gracefully
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            info!("Shutdown signal received, cleaning up...");
+            if let Err(e) = client.disconnect() {
+                error!("Error during disconnect: {}", e);
+            }
+            info!("Shutdown complete");
+        }
+        Err(err) => {
+            error!("Unable to listen for shutdown signal: {}", err);
         }
     }
-
-    // Reset lights after 5 seconds
-    sleep(Duration::from_secs(5)).await;
     
-    let mut reset_command = CommandLight::default();
-    reset_command.on = Some(true);
-    reset_command.bri = Some(254);
-    reset_command.hue = Some(8418);
-    reset_command.sat = Some(140);
-    reset_command.alert = Some("none".into());
-
-    if let Ok(lights) = bridge.get_all_lights() {
-        for light in lights {
-            let _ = bridge.set_light_state(
-                light.id,
-                &reset_command
-            );
-        }
-    }
-}
-
-async fn run_debug_cycle(bridge: Arc<Mutex<Bridge>>) {
-    println!("Running debug cycle...");
-    
-    // Simulate donation events
-    println!("Testing $150 donation effect");
-    handle_donation(
-        &bridge,
-        &StreamlabsEvent {
-            name: "Debug Donor".into(),
-            amount: Some("150".into()),
-            formatted_amount: Some("$150.00".into()),
-        },
-    ).await;
-    
-    sleep(Duration::from_secs(7)).await;
-    
-    println!("Testing $75 donation effect");
-    handle_donation(
-        &bridge,
-        &StreamlabsEvent {
-            name: "Debug Donor".into(),
-            amount: Some("75".into()),
-            formatted_amount: Some("$75.00".into()),
-        },
-    ).await;
-    
-    sleep(Duration::from_secs(7)).await;
-    
-    println!("Testing $25 donation effect");
-    handle_donation(
-        &bridge,
-        &StreamlabsEvent {
-            name: "Debug Donor".into(),
-            amount: Some("25".into()),
-            formatted_amount: Some("$25.00".into()),
-        },
-    ).await;
-    
-    sleep(Duration::from_secs(7)).await;
-    
-    // Simulate follow
-    println!("Testing follow effect");
-    handle_follow(&bridge).await;
-    
-    sleep(Duration::from_secs(7)).await;
-    
-    // Simulate subscription
-    println!("Testing subscription effect");
-    handle_subscription(&bridge).await;
-    
-    println!("Debug cycle complete!");
-}
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    dotenv().ok();
-    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let debug_mode = env::var("DEBUG_MODE").unwrap_or_else(|_| "false".to_string()) == "true";
-    let bridge = Arc::new(Mutex::new(init_bridge().await));
-
-    if debug_mode {
-        println!("Debug mode enabled - running effect cycle");
-        run_debug_cycle(bridge.clone()).await;
-    }
-
-    println!("Server starting on port {}", port);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(AppState {
-                bridge: bridge.clone(),
-            }))
-            .route("/webhook", web::post().to(handle_webhook))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
+    Ok(())
 }

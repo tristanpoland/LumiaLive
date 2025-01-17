@@ -1,0 +1,102 @@
+{
+    "credentials": {
+      "streamlabs": {
+        "socket_token": "your_streamlabs_socket_token_here"
+      },
+      "hue": {
+        "username": "your_hue_bridge_username",
+        "bridge_ip": null
+      }
+    },
+    "default_state": {
+      "on": true,
+      "brightness": 128,
+      "hue": 8418,
+      "saturation": 140,
+      "alert": "none"
+    },
+    "events": {
+      "donation": {
+        "enabled": true,
+        "tiers": [
+          {
+            "amount": 5.00,
+            "effect": {
+              "color": "#00ff00",
+              "brightness": 254,
+              "alert": "lselect",
+              "duration": 5000
+            }
+          },
+          {
+            "amount": 25.00,
+            "effect": {
+              "color": "#ff00ff",
+              "brightness": 254,
+              "alert": "lselect",
+              "duration": 10000
+            }
+          },
+          {
+            "amount": 100.00,
+            "effect": {
+              "color": "#ff0000",
+              "brightness": 254,
+              "alert": "lselect",
+              "duration": 15000
+            }
+          }
+        ]
+      },
+      "twitch_follow": {
+        "enabled": true,
+        "effect": {
+          "color": "#9146ff",
+          "brightness": 200,
+          "alert": "select",
+          "duration": 3000
+        }
+      },
+      "twitch_subscription": {
+        "enabled": true,
+        "effect": {
+          "color": "#00ffff",
+          "brightness": 254,
+          "alert": "lselect",
+          "duration": 5000
+        }
+      },
+      "twitch_bits": {
+        "enabled": true,
+        "tiers": [
+          {
+            "amount": 100,
+            "effect": {
+              "color": "#0000ff",
+              "brightness": 200,
+              "alert": "select",
+              "duration": 3000
+            }
+          },
+          {
+            "amount": 1000,
+            "effect": {
+              "color": "#ff00ff",
+              "brightness": 254,
+              "alert": "lselect",
+              "duration": 8000
+            }
+          },
+          {
+            "amount": 10000,
+            "effect": {
+              "color": "#ff0000",
+              "brightness": 254,
+              "alert": "lselect",
+              "duration": 12000
+            }
+          }
+        ]
+      }
+    }
+  }
