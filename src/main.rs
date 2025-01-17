@@ -13,6 +13,7 @@ use std::fs;
 use hex::FromHex;
 use log::{info, warn, error, debug};
 use tokio::signal;
+use tokio::sync::mpsc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -303,7 +304,6 @@ async fn main() -> Result<(), AppError> {
             .with_user(&config.credentials.hue.username)
     };
 
-    
     let bridge = Arc::new(Mutex::new(bridge));
     
     let state = Arc::new(AppState {
@@ -311,20 +311,42 @@ async fn main() -> Result<(), AppError> {
         config: config.clone(),
     });
 
+    // Create channels for event handling
+    let (event_tx, mut event_rx) = mpsc::channel::<StreamlabsEvent>(32);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+    // Get a handle to the current runtime
+    let rt = tokio::runtime::Handle::current();
+
+    // Spawn event handler task
+    let handle_events = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            while let Some(event) = event_rx.blocking_recv() {
+                if let Err(e) = rt.block_on(state.handle_event(event)) {
+                    error!("Error handling event: {}", e);
+                }
+                
+                // Check for shutdown signal
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+            }
+        })
+    };
+
     info!("Connecting to Streamlabs socket API...");
     let socket_url = "https://sockets.streamlabs.com";
     
     let client = ClientBuilder::new(socket_url)
         .on_any({
-            let state = state.clone();
-            move |event: Event, payload: Payload, _| {
+            let tx = event_tx.clone();
+            move |_event: Event, payload: Payload, _| {
                 if let Payload::String(message) = payload {
                     if let Ok(event) = serde_json::from_str::<StreamlabsEvent>(&message) {
-                        let state = state.clone();
-                        // Process events synchronously since we need to hold the bridge lock
-                        if let Err(e) = tokio::runtime::Handle::current()
-                            .block_on(state.handle_event(event)) {
-                            error!("Error handling event: {}", e);
+                        let tx = tx.clone();
+                        if let Err(e) = tx.blocking_send(event) {
+                            error!("Failed to send event to handler: {}", e);
                         }
                     } else {
                         warn!("Failed to parse Streamlabs event");
@@ -345,10 +367,17 @@ async fn main() -> Result<(), AppError> {
 
     info!("Connected and ready!");
     
-    // Handle shutdown gracefully
+    // Wait for ctrl-c
     match signal::ctrl_c().await {
         Ok(()) => {
             info!("Shutdown signal received, cleaning up...");
+            let _ = shutdown_tx.send(()).await; // Signal event handler to stop
+            drop(event_tx); // Close event channel
+            
+            if let Err(e) = handle_events.await {
+                error!("Error during event handler shutdown: {}", e);
+            }
+            
             if let Err(e) = client.disconnect() {
                 error!("Error during disconnect: {}", e);
             }
@@ -356,6 +385,7 @@ async fn main() -> Result<(), AppError> {
         }
         Err(err) => {
             error!("Unable to listen for shutdown signal: {}", err);
+            let _ = client.disconnect();
         }
     }
     
