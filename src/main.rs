@@ -321,15 +321,11 @@ async fn main() -> Result<(), AppError> {
                 if let Payload::String(message) = payload {
                     if let Ok(event) = serde_json::from_str::<StreamlabsEvent>(&message) {
                         let state = state.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            tokio::runtime::Runtime::new()
-                                .unwrap()
-                                .block_on(async {
-                                    if let Err(e) = state.handle_event(event).await {
-                                        error!("Error handling event: {}", e);
-                                    }
-                                });
-                        });
+                        // Process events synchronously since we need to hold the bridge lock
+                        if let Err(e) = tokio::runtime::Handle::current()
+                            .block_on(state.handle_event(event)) {
+                            error!("Error handling event: {}", e);
+                        }
                     } else {
                         warn!("Failed to parse Streamlabs event");
                     }
